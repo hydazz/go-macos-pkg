@@ -34,8 +34,8 @@ func NewConcurrentReader(ctx context.Context, r io.Reader, workers int) (*Reader
 	if pr.blockSize == 0 || pr.blockSize > maxBufferedChunk {
 		return nil, fmt.Errorf("pbzx: concurrent block size must be between 1 and %d", maxBufferedChunk)
 	}
-	pr.parallel = newConcurrentReader(ctx, r, pr.blockSize, workers, func(chunk *concurrentChunk) error {
-		return chunk.decode(pr.algo)
+	pr.parallel = newConcurrentReader(ctx, r, pr.blockSize, workers, func(ctx context.Context, chunk *concurrentChunk) error {
+		return chunk.decode(ctx, pr.algo)
 	})
 	return pr, nil
 }
@@ -58,7 +58,7 @@ type concurrentReader struct {
 	err     error
 }
 
-func newConcurrentReader(ctx context.Context, source io.Reader, blockSize uint64, workers int, decode func(*concurrentChunk) error) *concurrentReader {
+func newConcurrentReader(ctx context.Context, source io.Reader, blockSize uint64, workers int, decode func(context.Context, *concurrentChunk) error) *concurrentReader {
 	ctx, cancel := context.WithCancel(ctx)
 	r := &concurrentReader{
 		ctx: ctx, cancel: cancel,
@@ -125,7 +125,7 @@ func (r *concurrentReader) parse(source io.Reader, blockSize uint64, jobs chan<-
 	}
 }
 
-func (r *concurrentReader) decode(jobs <-chan *concurrentChunk, decode func(*concurrentChunk) error) {
+func (r *concurrentReader) decode(jobs <-chan *concurrentChunk, decode func(context.Context, *concurrentChunk) error) {
 	defer r.workers.Done()
 	for {
 		select {
@@ -135,13 +135,16 @@ func (r *concurrentReader) decode(jobs <-chan *concurrentChunk, decode func(*con
 			if !ok || r.ctx.Err() != nil {
 				return
 			}
-			chunk.err = decode(chunk)
+			chunk.err = decode(r.ctx, chunk)
 			close(chunk.ready)
 		}
 	}
 }
 
-func (c *concurrentChunk) decode(algo Algorithm) error {
+func (c *concurrentChunk) decode(ctx context.Context, algo Algorithm) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r, err := newChunkReader(algo, bytes.NewReader(c.src), c.header)
 	if err != nil {
 		return err
@@ -152,8 +155,13 @@ func (c *concurrentChunk) decode(algo Algorithm) error {
 		c.dst = make([]byte, size)
 	}
 	c.dst = c.dst[:size]
+	// Limit each streaming decode step so cancellation does not wait for a
+	// whole XZ or zlib block to expand.
 	for n := 0; n < size; {
-		read, err := r.Read(c.dst[n:])
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		read, err := r.Read(c.dst[n:min(n+(64<<10), size)])
 		n += read
 		if err == io.EOF {
 			return nil

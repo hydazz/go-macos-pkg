@@ -137,7 +137,7 @@ func await[T any](t *testing.T, done <-chan T) T {
 
 func testReader(t *testing.T, ctx context.Context, source io.Reader, decode func(*concurrentChunk) error) *Reader {
 	t.Helper()
-	r := &Reader{parallel: newConcurrentReader(ctx, source, 1024, 4, decode)}
+	r := &Reader{parallel: newConcurrentReader(ctx, source, 1024, 4, func(_ context.Context, c *concurrentChunk) error { return decode(c) })}
 	t.Cleanup(func() { _ = r.Close() })
 	return r
 }
@@ -295,6 +295,24 @@ func TestConcurrentErrorDoesNotWaitForSource(t *testing.T) {
 	// The caller releases its source before joining the library's workers.
 	input.Close()
 	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentCloseCancelsActiveDecoders(t *testing.T) {
+	started := make(chan struct{}, 4)
+	r := &Reader{parallel: newConcurrentReader(t.Context(), bytes.NewReader(fakeStream(20)[12:]), 1024, 4, func(ctx context.Context, _ *concurrentChunk) error {
+		started <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	})}
+	t.Cleanup(func() { _ = r.Close() })
+	for range 4 {
+		await(t, started)
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.Close() }()
+	if err := await(t, done); err != nil {
 		t.Fatal(err)
 	}
 }

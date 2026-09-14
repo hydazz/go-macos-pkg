@@ -4,12 +4,12 @@
 package xar
 
 import (
+	"bufio"
 	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
 	"compress/zlib"
 	"crypto/subtle"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -294,7 +294,7 @@ func (x *Reader) OpenEA(ea *EA) (io.ReadCloser, error) {
 }
 
 // decode wraps stored bytes in the decoder their encoding style names.
-func decode(raw *io.SectionReader, style string) (io.ReadCloser, error) {
+func decode(raw io.Reader, style string) (io.ReadCloser, error) {
 	switch strings.ToLower(strings.TrimSpace(style)) {
 	case EncodingNone, "":
 		return io.NopCloser(raw), nil
@@ -302,15 +302,16 @@ func decode(raw *io.SectionReader, style string) (io.ReadCloser, error) {
 		// The style says gzip; the bytes are zlib. Sniff anyway, because a
 		// writer that took the name literally would produce real gzip and
 		// there is no reason to refuse it.
-		var magic [2]byte
-		if _, err := raw.ReadAt(magic[:], 0); err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
-			gz, err := gzip.NewReader(raw)
+		buffer := bufio.NewReader(raw)
+		magic, err := buffer.Peek(2)
+		if err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
+			gz, err := gzip.NewReader(buffer)
 			if err != nil {
 				return nil, fmt.Errorf("xar: %w", err)
 			}
 			return gz, nil
 		}
-		zr, err := zlib.NewReader(raw)
+		zr, err := zlib.NewReader(buffer)
 		if err != nil {
 			return nil, fmt.Errorf("xar: %w", err)
 		}
@@ -334,53 +335,17 @@ func decode(raw *io.SectionReader, style string) (io.ReadCloser, error) {
 	}
 }
 
-// Verify checks the entry's archived checksum against its stored bytes and
-// its extracted checksum against its decoded bytes. Entries without
-// checksums verify trivially.
+// Verify checks the entry's stored and decoded lengths and any checksums present.
+// Entries without data verify trivially.
 func (x *Reader) Verify(f *File) error {
 	if f.Data == nil {
 		return nil
 	}
-	if d := f.Data.ArchivedChecksum; d != nil && d.Value != "" {
-		raw, err := x.OpenRaw(f)
-		if err != nil {
-			return err
-		}
-		if err := checkDigest(raw, d, "archived"); err != nil {
-			return fmt.Errorf("xar: %s: %w", f.Path(), err)
-		}
-	}
-	if d := f.Data.ExtractedChecksum; d != nil && d.Value != "" {
-		rc, err := x.Open(f)
-		if err != nil {
-			return err
-		}
-		defer rc.Close()
-		if err := checkDigest(rc, d, "extracted"); err != nil {
-			return fmt.Errorf("xar: %s: %w", f.Path(), err)
-		}
-	}
-	return nil
-}
-
-func checkDigest(r io.Reader, d *Digest, what string) error {
-	alg, err := ParseChecksumStyle(d.Style)
+	r, err := x.OpenVerified(f)
 	if err != nil {
 		return err
 	}
-	h, err := alg.New()
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(h, r); err != nil {
-		return err
-	}
-	want, err := hex.DecodeString(strings.TrimSpace(d.Value))
-	if err != nil {
-		return fmt.Errorf("malformed %s checksum %q", what, d.Value)
-	}
-	if !bytes.Equal(h.Sum(nil), want) {
-		return fmt.Errorf("%s checksum mismatch", what)
-	}
-	return nil
+	defer r.Close()
+	_, err = io.Copy(io.Discard, r)
+	return err
 }

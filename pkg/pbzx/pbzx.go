@@ -21,6 +21,7 @@
 package pbzx
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
@@ -104,10 +105,9 @@ type Reader struct {
 	r         io.Reader
 	algo      Algorithm
 	blockSize uint64
-	chunk     io.Reader // decoder over the current chunk, nil between chunks
-	stored    io.Reader // the current chunk's stored bytes, to drain when done
-	left      int64     // decoded bytes still expected from the current chunk
+	chunk     *chunkReader
 	err       error
+	parallel  *concurrentReader
 }
 
 // NewReader validates the header and returns a streaming decoder.
@@ -139,92 +139,128 @@ func (pr *Reader) Flags() uint64 { return pr.blockSize }
 
 // Read decodes into p.
 func (pr *Reader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if pr.parallel != nil {
+		return pr.parallel.Read(p)
+	}
 	for {
 		if pr.err != nil {
 			return 0, pr.err
 		}
 		if pr.chunk == nil {
-			if err := pr.nextChunk(); err != nil {
+			header, err := readChunkHeader(pr.r)
+			if err == nil {
+				pr.chunk, err = newChunkReader(pr.algo, pr.r, header)
+			}
+			if err != nil {
 				pr.err = err
 				return 0, err
 			}
 		}
 		n, err := pr.chunk.Read(p)
-		pr.left -= int64(n)
 		if err == io.EOF {
-			if pr.left != 0 {
-				pr.err = fmt.Errorf("pbzx: chunk decoded short by %d bytes", pr.left)
-				return n, pr.err
-			}
-			// A streaming decoder may stop before the stream's trailer
-			// (xz index and footer); drain what is left of the stored
-			// chunk so the next header is read from the right place.
-			if _, err := io.Copy(io.Discard, pr.stored); err != nil {
-				pr.err = fmt.Errorf("pbzx: unable to skip chunk trailer: %w", err)
-				return n, pr.err
-			}
 			pr.chunk = nil
-			if n > 0 {
-				return n, nil
+			if n == 0 {
+				continue
 			}
-			continue
+			return n, nil
+		}
+		if err != nil {
+			pr.err = err
 		}
 		return n, err
 	}
 }
 
-func (pr *Reader) nextChunk() error {
-	var hdr [16]byte
-	if _, err := io.ReadFull(pr.r, hdr[:]); err != nil {
-		if err == io.EOF {
-			return io.EOF
-		}
-		return fmt.Errorf("pbzx: unable to read chunk header: %w", err)
-	}
-	inflated := binary.BigEndian.Uint64(hdr[0:8])
-	deflated := binary.BigEndian.Uint64(hdr[8:16])
-	if inflated > 1<<40 || deflated > 1<<40 {
-		return fmt.Errorf("pbzx: implausible chunk sizes (%d, %d)", inflated, deflated)
-	}
-	if deflated > inflated {
-		return fmt.Errorf("pbzx: chunk grew (%d stored for %d decoded)", deflated, inflated)
-	}
-	stored := io.LimitReader(pr.r, int64(deflated))
-	pr.stored = stored
-	pr.left = int64(inflated)
-
-	// A chunk that did not compress is stored as is, and its sizes agree.
-	if inflated == deflated {
-		pr.chunk = stored
+// Close stops concurrent decoding and waits for workers to finish. It does not
+// close the input. The caller must interrupt any blocked input Read before Close,
+// for example by closing its pipe. Close may run concurrently with Read on a
+// reader returned by NewConcurrentReader.
+func (pr *Reader) Close() error {
+	if pr.parallel != nil {
+		pr.parallel.cancel()
+		pr.parallel.workers.Wait()
 		return nil
 	}
-	switch pr.algo {
+	if pr.chunk != nil {
+		return pr.chunk.Close()
+	}
+	return nil
+}
+
+type chunkHeader struct {
+	inflated, deflated uint64
+}
+
+func readChunkHeader(r io.Reader) (chunkHeader, error) {
+	var hdr [16]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		if err == io.EOF {
+			return chunkHeader{}, io.EOF
+		}
+		return chunkHeader{}, fmt.Errorf("pbzx: unable to read chunk header: %w", err)
+	}
+	h := chunkHeader{binary.BigEndian.Uint64(hdr[:8]), binary.BigEndian.Uint64(hdr[8:])}
+	if h.inflated > 1<<40 || h.deflated > 1<<40 {
+		return h, fmt.Errorf("pbzx: implausible chunk sizes (%d, %d)", h.inflated, h.deflated)
+	}
+	if h.deflated > h.inflated {
+		return h, fmt.Errorf("pbzx: chunk grew (%d stored for %d decoded)", h.deflated, h.inflated)
+	}
+	return h, nil
+}
+
+type chunkReader struct {
+	decoded io.Reader
+	stored  *io.LimitedReader
+	buffer  *bufio.Reader
+	left    int64
+}
+
+func newChunkReader(algo Algorithm, source io.Reader, header chunkHeader) (*chunkReader, error) {
+	inflated, deflated := header.inflated, header.deflated
+	stored := &io.LimitedReader{R: source, N: int64(deflated)}
+	chunk := &chunkReader{stored: stored, left: int64(inflated)}
+	// A chunk that did not compress is stored as is, and its sizes agree.
+	if inflated == deflated {
+		chunk.decoded = stored
+		return chunk, nil
+	}
+	switch algo {
 	case XZ:
-		br := &peekReader{r: stored}
-		if head, err := br.peek(6); err == nil && !bytes.Equal(head, xzMagic) {
-			return fmt.Errorf("pbzx: chunk is not an xz stream")
+		chunk.buffer = bufio.NewReader(stored)
+		if head, err := chunk.buffer.Peek(6); err == nil && !bytes.Equal(head, xzMagic) {
+			return nil, fmt.Errorf("pbzx: chunk is not an xz stream")
 		}
-		xr, err := xz.NewReader(br)
+		xr, err := xz.NewReader(chunk.buffer)
 		if err != nil {
-			return fmt.Errorf("pbzx: bad xz chunk: %w", err)
+			return nil, fmt.Errorf("pbzx: bad xz chunk: %w", err)
 		}
-		pr.chunk = io.LimitReader(xr, int64(inflated))
+		chunk.decoded = xr
 	case Zlib:
-		zr, err := zlib.NewReader(stored)
+		// Supplying ReadByte prevents zlib from consuming trailing bytes
+		// beyond its stream without leaving them available for validation.
+		chunk.buffer = bufio.NewReader(stored)
+		zr, err := zlib.NewReader(chunk.buffer)
 		if err != nil {
-			return fmt.Errorf("pbzx: bad zlib chunk: %w", err)
+			return nil, fmt.Errorf("pbzx: bad zlib chunk: %w", err)
 		}
-		pr.chunk = io.LimitReader(zr, int64(inflated))
+		chunk.decoded = zr
 	case LZFSE, LZ4, LZBitmap:
 		if inflated > maxBufferedChunk {
-			return fmt.Errorf("pbzx: %s chunk of %d bytes exceeds the %d-byte limit", pr.algo, inflated, maxBufferedChunk)
+			return nil, fmt.Errorf("pbzx: %s chunk of %d bytes exceeds the %d-byte limit", algo, inflated, maxBufferedChunk)
 		}
 		data, err := io.ReadAll(stored)
 		if err != nil {
-			return fmt.Errorf("pbzx: unable to read chunk: %w", err)
+			return nil, fmt.Errorf("pbzx: unable to read chunk: %w", err)
+		}
+		if stored.N != 0 {
+			return nil, fmt.Errorf("pbzx: truncated chunk: %w", io.ErrUnexpectedEOF)
 		}
 		var out []byte
-		switch pr.algo {
+		switch algo {
 		case LZFSE:
 			out, err = lzfse.Decompress(data)
 		case LZBitmap:
@@ -233,42 +269,56 @@ func (pr *Reader) nextChunk() error {
 			out, err = decodeLZ4Frames(data, int(inflated))
 		}
 		if err != nil {
-			return fmt.Errorf("pbzx: bad %s chunk: %w", pr.algo, err)
+			return nil, fmt.Errorf("pbzx: bad %s chunk: %w", algo, err)
 		}
 		if uint64(len(out)) != inflated {
-			return fmt.Errorf("pbzx: %s chunk decoded to %d bytes, header says %d", pr.algo, len(out), inflated)
+			return nil, fmt.Errorf("pbzx: %s chunk decoded to %d bytes, header says %d", algo, len(out), inflated)
 		}
-		pr.chunk = bytes.NewReader(out)
+		chunk.decoded = bytes.NewReader(out)
 	default:
-		return fmt.Errorf("%w: %s", ErrUnsupportedAlgorithm, pr.algo)
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedAlgorithm, algo)
 	}
-	return nil
+	return chunk, nil
 }
 
-// peekReader lets nextChunk look at the first bytes of a chunk without
-// consuming them from the underlying limited reader.
-type peekReader struct {
-	r    io.Reader
-	head []byte
-}
-
-func (p *peekReader) peek(n int) ([]byte, error) {
-	buf := make([]byte, n)
-	got, err := io.ReadFull(p.r, buf)
-	p.head = buf[:got]
-	if err == io.ErrUnexpectedEOF {
-		err = io.EOF
+func (c *chunkReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
 	}
-	return p.head, err
-}
-
-func (p *peekReader) Read(b []byte) (int, error) {
-	if len(p.head) > 0 {
-		n := copy(b, p.head)
-		p.head = p.head[n:]
+	n, err := c.decoded.Read(p[:min(int64(len(p)), c.left)])
+	c.left -= int64(n)
+	if err != nil && err != io.EOF {
+		return n, err
+	}
+	if c.left != 0 {
+		if err == io.EOF {
+			return n, fmt.Errorf("pbzx: chunk decoded short by %d bytes: %w", c.left, io.ErrUnexpectedEOF)
+		}
 		return n, nil
 	}
-	return p.r.Read(b)
+	// Reaching the declared size is not EOF: read the decoder through its
+	// trailer to validate checksums and reject an oversized expansion.
+	var extra [1]byte
+	if _, err := io.ReadFull(c.decoded, extra[:]); err != io.EOF {
+		if err != nil {
+			return n, err
+		}
+		return n, fmt.Errorf("pbzx: chunk decoded beyond its declared size")
+	}
+	if c.stored.N != 0 || c.buffer != nil && c.buffer.Buffered() != 0 {
+		return n, fmt.Errorf("pbzx: trailing or truncated chunk data")
+	}
+	if err := c.Close(); err != nil {
+		return n, err
+	}
+	return n, io.EOF
+}
+
+func (c *chunkReader) Close() error {
+	if closer, ok := c.decoded.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
 }
 
 // Writer encodes a pbz* stream.
